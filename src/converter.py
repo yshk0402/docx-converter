@@ -109,6 +109,7 @@ class DocumentProcessor:
                 lines.extend(processed_lines)
             
             return '\n\n'.join(lines)
+        
         except Exception as e:
             self.logger.error(f"Markdown変換エラー: {str(e)}")
             raise ValueError(f"Markdown変換エラー: {str(e)}")
@@ -143,7 +144,6 @@ class DocumentProcessor:
         except Exception as e:
             self.logger.error(f"構造抽出エラー: {str(e)}")
             raise ValueError(f"構造抽出エラー: {str(e)}")
-
 class MessageConverter:
     """メッセージ変換の主要クラス"""
     def __init__(self):
@@ -164,7 +164,7 @@ class MessageConverter:
         
         # プレフィックスとサフィックスを削除
         prefixes = ['部署', 'お', '■', '□', '●', '※']
-        suffixes = ['・事業所名', 'の内容', 'について', 'のお願い', '：', ':']
+        suffixes = ['・事業所名', 'の内容', 'について', 'のお願い', '：', ':', '欄']
         
         for prefix in prefixes:
             if name.startswith(prefix):
@@ -295,8 +295,7 @@ class MessageConverter:
             return f"{main_content[:200]}（文字数超過）"
         
         return main_content
-
-    def extract_content_for_column(self, structure: Dict, column: str) -> str:
+def extract_content_for_column(self, structure: Dict, column: str) -> str:
         """特定のカラムの内容を抽出"""
         content = []
         
@@ -386,4 +385,7 @@ class MessageConverter:
                 )
 
         if not processed_docs:
-            return pd.DataFrame(), self.processor.
+            return pd.DataFrame(), self.processor.errors
+
+        df = pd.DataFrame(processed_docs)
+        return df, self.processor.errors
