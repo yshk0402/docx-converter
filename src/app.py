@@ -18,30 +18,28 @@ class DocxConverterApp:
     def setup_streamlit(self):
         """Streamlit設定の初期化"""
         st.set_page_config(
-            page_title="DOCX Converter",
+            page_title="文書変換アプリ",
             page_icon="📄",
             layout="wide"
         )
-        # セッション状態の初期化
         if 'processed_df' not in st.session_state:
             st.session_state.processed_df = None
         if 'errors' not in st.session_state:
             st.session_state.errors = []
-        if 'selected_columns' not in st.session_state:
-            st.session_state.selected_columns = []
-        if 'available_columns' not in st.session_state:
-            st.session_state.available_columns = set()
+        if 'uploaded_files' not in st.session_state:
+            st.session_state.uploaded_files = None
 
-    def read_docx(self, file) -> Dict[str, str]:
+    def read_docx(self, file) -> Optional[Dict[str, str]]:
         """DOCXファイルの読み込み"""
         try:
             doc = docx.Document(file)
             content = "\n".join([paragraph.text for paragraph in doc.paragraphs])
             return {"document_content": content}
         except Exception as e:
-            raise ValueError(f"ファイルの読み込みに失敗しました: {str(e)}")
+            st.error(f"ファイルの読み込みに失敗しました: {str(e)}")
+            return None
 
-    def create_excel_with_highlights(self, df: pd.DataFrame, errors: List[ProcessingError]) -> bytes:
+    def create_excel_with_highlights(self, df: pd.DataFrame, errors: List[ProcessingError]) -> Optional[bytes]:
         """エラーハイライト付きExcelの作成"""
         try:
             output = io.BytesIO()
@@ -63,23 +61,18 @@ class DocxConverterApp:
                 # カラム幅の自動調整
                 for column in worksheet.columns:
                     max_length = 0
-                    column_name = column[0].value
-                    
-                    # すべての行をチェックして最大長を取得
                     for cell in column:
                         try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
+                            max_length = max(max_length, len(str(cell.value)))
                         except:
                             pass
-                    
-                    # 最大長に基づいてカラム幅を設定（最小幅10、最大幅50）
                     adjusted_width = min(max(10, max_length + 2), 50)
                     worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
             
             return output.getvalue()
         except Exception as e:
-            raise ValueError(f"Excelファイルの作成に失敗しました: {str(e)}")
+            st.error(f"Excelファイルの作成に失敗しました: {str(e)}")
+            return None
 
     def display_preview(self, content: str):
         """文書のプレビュー表示"""
@@ -99,18 +92,6 @@ class DocxConverterApp:
                     if error.details:
                         st.write(f"詳細: {error.details}")
 
-    def get_default_columns(self, available_columns: set) -> List[str]:
-        """デフォルトのカラムを取得"""
-        default_columns = []
-        if available_columns:
-            default_columns = ['番号']  # 番号は常に含める
-            # 優先順位に基づいてカラムを追加
-            priority_columns = ['原稿', '部署', '名前']
-            for col in priority_columns:
-                if col in available_columns:
-                    default_columns.append(col)
-        return default_columns
-
     def process_files(self, files: List) -> Optional[List[Dict]]:
         """ファイルの処理"""
         documents = []
@@ -125,11 +106,12 @@ class DocxConverterApp:
                 status_text.text(f"処理中... {i + 1}/{len(files)} ファイル")
 
                 doc = self.read_docx(file)
-                documents.append(doc)
+                if doc:  # docがNoneでない場合のみ追加
+                    documents.append(doc)
                 time.sleep(0.1)  # UI更新のための小さな遅延
 
             status_text.text("処理完了")
-            return documents
+            return documents if documents else None
 
         except Exception as e:
             progress_bar.empty()
@@ -144,7 +126,8 @@ class DocxConverterApp:
         uploaded_files = st.file_uploader(
             "DOCXファイルをアップロードしてください",
             type="docx",
-            accept_multiple_files=True
+            accept_multiple_files=True,
+            key="file_uploader"
         )
 
         if uploaded_files:
@@ -153,8 +136,9 @@ class DocxConverterApp:
             if documents:
                 try:
                     # 利用可能なカラムを取得
-                    st.session_state.available_columns = \
-                        self.converter.extract_potential_columns(documents[0]['document_content'])
+                    available_columns = self.converter.extract_potential_columns(
+                        documents[0]['document_content']
+                    )
                     
                     # プレビュー表示
                     self.display_preview(documents[0]['document_content'])
@@ -162,22 +146,23 @@ class DocxConverterApp:
                     # カラム選択UI
                     col1, col2 = st.columns(2)
                     with col1:
-                        # デフォルトのカラムを取得
-                        default_columns = self.get_default_columns(st.session_state.available_columns)
+                        default_columns = ['番号']
+                        if '原稿' in available_columns:
+                            default_columns.append('原稿')
                         
-                        st.session_state.selected_columns = st.multiselect(
+                        selected_columns = st.multiselect(
                             "使用するカラムを選択：",
-                            list(st.session_state.available_columns),
+                            list(available_columns),
                             default=default_columns
                         )
                     
                     with col2:
                         if st.button("カラム設定を保存"):
-                            self.config.update_favorite_columns(st.session_state.selected_columns)
+                            self.config.update_favorite_columns(selected_columns)
                             st.success("カラム設定を保存しました")
 
-                    if st.session_state.selected_columns:
-                        self.converter.selected_columns = st.session_state.selected_columns
+                    if selected_columns:
+                        self.converter.selected_columns = selected_columns
 
                         # データ処理
                         df, errors = self.converter.process_documents(documents)
@@ -186,7 +171,7 @@ class DocxConverterApp:
                         self.display_errors(errors)
 
                         # 結果表示
-                        if not df.empty:
+                        if df is not None and not df.empty:
                             st.subheader("変換結果")
                             
                             # データフレームの編集機能
@@ -199,13 +184,14 @@ class DocxConverterApp:
                             
                             # エクセルファイルのダウンロード
                             excel_data = self.create_excel_with_highlights(edited_df, errors)
-                            st.download_button(
-                                label="Excelファイルをダウンロード",
-                                data=excel_data,
-                                file_name="converted_data.xlsx",
-                                mime="application/vnd.ms-excel",
-                                key='download_button'
-                            )
+                            if excel_data:
+                                st.download_button(
+                                    label="Excelファイルをダウンロード",
+                                    data=excel_data,
+                                    file_name="converted_data.xlsx",
+                                    mime="application/vnd.ms-excel",
+                                    key='download_button'
+                                )
 
                 except Exception as e:
                     st.error(f"予期せぬエラーが発生しました: {str(e)}")
