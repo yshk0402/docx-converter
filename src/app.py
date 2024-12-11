@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import docx
 import io
+import openpyxl
+from typing import List, Dict
 from pathlib import Path
 from converter import MessageConverter, ProcessingError
 from config import Config
