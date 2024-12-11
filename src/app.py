@@ -1,201 +1,200 @@
-import streamlit as st
-import pandas as pd
-import docx
-import io
-import openpyxl
-from typing import List, Dict, Optional
+import json
+import os
 from pathlib import Path
-from converter import MessageConverter, ProcessingError
-from config import Config
-import time
+from typing import List, Dict, Optional, Any
+import logging
+from datetime import datetime
+import shutil
 
-class DocxConverterApp:
+class Config:
     def __init__(self):
-        self.converter = MessageConverter()
-        self.config = Config()
-        self.setup_streamlit()
+        """設定管理クラスの初期化"""
+        self.config_dir = Path.home() / '.docx_converter'
+        self.config_file = self.config_dir / 'config.json'
+        self.log_dir = self.config_dir / 'logs'
+        self.backup_dir = self.config_dir / 'backups'
+        
+        # ロギングの設定
+        self._setup_logging()
+        
+        # 設定ディレクトリの初期化
+        self.ensure_config_dir()
 
-    def setup_streamlit(self):
-        """Streamlit設定の初期化"""
-        st.set_page_config(
-            page_title="文書変換アプリ",
-            page_icon="📄",
-            layout="wide"
-        )
-        if 'processed_df' not in st.session_state:
-            st.session_state.processed_df = None
-        if 'errors' not in st.session_state:
-            st.session_state.errors = []
-        if 'uploaded_files' not in st.session_state:
-            st.session_state.uploaded_files = None
-
-    def read_docx(self, file) -> Optional[Dict[str, str]]:
-        """DOCXファイルの読み込み"""
+    def _setup_logging(self):
+        """ロギングの設定"""
         try:
-            doc = docx.Document(file)
-            content = "\n".join([paragraph.text for paragraph in doc.paragraphs])
-            return {"document_content": content}
-        except Exception as e:
-            st.error(f"ファイルの読み込みに失敗しました: {str(e)}")
-            return None
-
-    def create_excel_with_highlights(self, df: pd.DataFrame, errors: List[ProcessingError]) -> Optional[bytes]:
-        """エラーハイライト付きExcelの作成"""
-        try:
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='データ')
-                workbook = writer.book
-                worksheet = writer.sheets['データ']
-                
-                # エラー行の背景色を設定
-                error_rows = set(error.document_index for error in errors)
-                for row_idx in error_rows:
-                    for cell in worksheet[row_idx + 2]:  # Excel行は1から始まり、ヘッダーがあるため+2
-                        cell.fill = openpyxl.styles.PatternFill(
-                            start_color='FFE7E6',
-                            end_color='FFE7E6',
-                            fill_type='solid'
-                        )
-                
-                # カラム幅の自動調整
-                for column in worksheet.columns:
-                    max_length = 0
-                    for cell in column:
-                        try:
-                            max_length = max(max_length, len(str(cell.value)))
-                        except:
-                            pass
-                    adjusted_width = min(max(10, max_length + 2), 50)
-                    worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = self.log_dir / 'config.log'
             
-            return output.getvalue()
+            logging.basicConfig(
+                filename=log_file,
+                level=logging.INFO,
+                format='%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+            self.logger = logging.getLogger(__name__)
         except Exception as e:
-            st.error(f"Excelファイルの作成に失敗しました: {str(e)}")
-            return None
+            print(f"ロギングの設定に失敗しました: {str(e)}")
+            raise
 
-    def display_preview(self, content: str):
-        """文書のプレビュー表示"""
-        st.subheader("プレビュー")
-        with st.expander("文書内容", expanded=True):
-            st.text_area("", value=content[:500] + "..." if len(content) > 500 else content, 
-                        height=200, disabled=True)
-
-    def display_errors(self, errors: List[ProcessingError]):
-        """エラーの表示"""
-        if errors:
-            st.error("処理中にエラーが発生しました")
-            for error in errors:
-                with st.expander(f"文書 {error.document_index + 1} のエラー"):
-                    st.write(f"種類: {error.error_type}")
-                    st.write(f"メッセージ: {error.message}")
-                    if error.details:
-                        st.write(f"詳細: {error.details}")
-
-    def process_files(self, files: List) -> Optional[List[Dict]]:
-        """ファイルの処理"""
-        documents = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
+    def ensure_config_dir(self):
+        """設定ディレクトリの作成と初期化"""
         try:
-            for i, file in enumerate(files):
-                # 進捗表示の更新
-                progress = (i + 1) / len(files)
-                progress_bar.progress(progress)
-                status_text.text(f"処理中... {i + 1}/{len(files)} ファイル")
-
-                doc = self.read_docx(file)
-                if doc:  # docがNoneでない場合のみ追加
-                    documents.append(doc)
-                time.sleep(0.1)  # UI更新のための小さな遅延
-
-            status_text.text("処理完了")
-            return documents if documents else None
-
-        except Exception as e:
-            progress_bar.empty()
-            status_text.empty()
-            st.error(f"ファイル処理中にエラーが発生しました: {str(e)}")
-            return None
-
-    def run(self):
-        """アプリケーションのメイン処理"""
-        st.title("文書変換アプリ")
-
-        uploaded_files = st.file_uploader(
-            "DOCXファイルをアップロードしてください",
-            type="docx",
-            accept_multiple_files=True,
-            key="file_uploader"
-        )
-
-        if uploaded_files:
-            documents = self.process_files(uploaded_files)
+            # 必要なディレクトリを作成
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            self.log_dir.mkdir(parents=True, exist_ok=True)
             
-            if documents:
-                try:
-                    # 利用可能なカラムを取得
-                    available_columns = self.converter.extract_potential_columns(
-                        documents[0]['document_content']
-                    )
-                    
-                    # プレビュー表示
-                    self.display_preview(documents[0]['document_content'])
-                    
-                    # カラム選択UI
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        default_columns = ['番号']
-                        if '原稿' in available_columns:
-                            default_columns.append('原稿')
-                        
-                        selected_columns = st.multiselect(
-                            "使用するカラムを選択：",
-                            list(available_columns),
-                            default=default_columns
-                        )
-                    
-                    with col2:
-                        if st.button("カラム設定を保存"):
-                            self.config.update_favorite_columns(selected_columns)
-                            st.success("カラム設定を保存しました")
+            # 設定ファイルが存在しない場合は作成
+            if not self.config_file.exists():
+                self.save_config(self._get_default_config())
+                self.logger.info("デフォルト設定ファイルを作成しました")
+        except Exception as e:
+            self.logger.error(f"設定ディレクトリの初期化中にエラーが発生: {str(e)}")
+            raise
 
-                    if selected_columns:
-                        self.converter.selected_columns = selected_columns
+    def _get_default_config(self) -> Dict[str, Any]:
+        """デフォルト設定の取得"""
+        return {
+            'version': '1.0.0',
+            'last_modified': datetime.now().isoformat(),
+            'favorite_columns': ['番号', '原稿'],
+            'settings': {
+                'max_preview_length': 500,
+                'default_columns': ['番号', '原稿'],
+                'excel_settings': {
+                    'default_sheet_name': 'データ',
+                    'error_highlight_color': 'FFE7E6',
+                    'min_column_width': 10,
+                    'max_column_width': 50
+                },
+                'validation': {
+                    'min_text_length': 150,
+                    'max_text_length': 200
+                }
+            }
+        }
 
-                        # データ処理
-                        df, errors = self.converter.process_documents(documents)
-                        
-                        # エラー表示
-                        self.display_errors(errors)
+    def _create_backup(self):
+        """設定ファイルのバックアップを作成"""
+        if self.config_file.exists():
+            try:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_file = self.backup_dir / f'config_{timestamp}.json'
+                
+                # バックアップを作成
+                shutil.copy2(self.config_file, backup_file)
+                self.logger.info(f"設定ファイルのバックアップを作成: {backup_file}")
+                
+                # 古いバックアップの削除（最新の5つのみ保持）
+                self._cleanup_old_backups()
+            except Exception as e:
+                self.logger.error(f"バックアップ作成中にエラーが発生: {str(e)}")
 
-                        # 結果表示
-                        if df is not None and not df.empty:
-                            st.subheader("変換結果")
-                            
-                            # データフレームの編集機能
-                            edited_df = st.data_editor(
-                                df,
-                                num_rows="dynamic",
-                                use_container_width=True,
-                                height=400
-                            )
-                            
-                            # エクセルファイルのダウンロード
-                            excel_data = self.create_excel_with_highlights(edited_df, errors)
-                            if excel_data:
-                                st.download_button(
-                                    label="Excelファイルをダウンロード",
-                                    data=excel_data,
-                                    file_name="converted_data.xlsx",
-                                    mime="application/vnd.ms-excel",
-                                    key='download_button'
-                                )
+    def _cleanup_old_backups(self, keep_count: int = 5):
+        """古いバックアップファイルの削除"""
+        try:
+            backup_files = sorted(self.backup_dir.glob('config_*.json'))
+            if len(backup_files) > keep_count:
+                for old_file in backup_files[:-keep_count]:
+                    old_file.unlink()
+                    self.logger.info(f"古いバックアップファイルを削除: {old_file}")
+        except Exception as e:
+            self.logger.error(f"バックアップクリーンアップ中にエラーが発生: {str(e)}")
 
-                except Exception as e:
-                    st.error(f"予期せぬエラーが発生しました: {str(e)}")
+    def _handle_corrupt_config(self):
+        """破損した設定ファイルの処理"""
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            corrupt_file = self.config_dir / f'corrupt_config_{timestamp}.json'
+            
+            if self.config_file.exists():
+                shutil.move(self.config_file, corrupt_file)
+                self.logger.warning(f"破損した設定ファイルを移動: {corrupt_file}")
+        except Exception as e:
+            self.logger.error(f"破損ファイルの処理中にエラーが発生: {str(e)}")
 
-if __name__ == "__main__":
-    app = DocxConverterApp()
-    app.run()
+    def load_config(self) -> Dict[str, Any]:
+        """設定の読み込み"""
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                self.logger.debug("設定ファイルを読み込みました")
+                return config
+            else:
+                self.logger.warning("設定ファイルが存在しないためデフォルト設定を使用します")
+                return self._get_default_config()
+        except json.JSONDecodeError as e:
+            self.logger.error(f"設定ファイルの解析に失敗: {str(e)}")
+            self._handle_corrupt_config()
+            return self._get_default_config()
+        except Exception as e:
+            self.logger.error(f"設定ファイルの読み込み中にエラーが発生: {str(e)}")
+            return self._get_default_config()
+
+    def save_config(self, config: Dict[str, Any]):
+        """設定の保存"""
+        try:
+            # バックアップの作成
+            self._create_backup()
+            
+            # 設定の更新
+            config['last_modified'] = datetime.now().isoformat()
+            
+            # 設定の保存
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info("設定ファイルを保存しました")
+        except Exception as e:
+            self.logger.error(f"設定ファイルの保存中にエラーが発生: {str(e)}")
+            raise
+
+    def update_favorite_columns(self, columns: List[str]):
+        """よく使うカラムの更新"""
+        try:
+            config = self.load_config()
+            
+            # 重複を除去し、順序を保持
+            columns = list(dict.fromkeys(columns))
+            
+            config['favorite_columns'] = columns
+            self.save_config(config)
+            
+            self.logger.info(f"お気に入りカラムを更新しました: {columns}")
+        except Exception as e:
+            self.logger.error(f"お気に入りカラムの更新中にエラーが発生: {str(e)}")
+            raise
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        """特定の設定値の取得"""
+        try:
+            config = self.load_config()
+            return config.get('settings', {}).get(key, default)
+        except Exception as e:
+            self.logger.error(f"設定値の取得中にエラーが発生: {str(e)}")
+            return default
+
+    def update_setting(self, key: str, value: Any):
+        """特定の設定値の更新"""
+        try:
+            config = self.load_config()
+            if 'settings' not in config:
+                config['settings'] = {}
+            config['settings'][key] = value
+            self.save_config(config)
+            self.logger.info(f"設定を更新しました: {key}={value}")
+        except Exception as e:
+            self.logger.error(f"設定の更新中にエラーが発生: {str(e)}")
+            raise
+
+    def reset_config(self):
+        """設定を初期状態に戻す"""
+        try:
+            self._create_backup()
+            self.save_config(self._get_default_config())
+            self.logger.info("設定を初期化しました")
+        except Exception as e:
+            self.logger.error(f"設定の初期化中にエラーが発生: {str(e)}")
+            raise
