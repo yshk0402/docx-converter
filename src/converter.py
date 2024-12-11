@@ -20,18 +20,20 @@ class DocumentProcessor:
     def convert_to_markdown(self, content: str) -> str:
         """文書をMarkdown形式に変換"""
         try:
-            content = re.sub(r'\*\*【(.+?)】\*\*', r'## \1', content)
+            # 特殊文字のエスケープ
+            content = content.replace('*', '\*')
+            # 見出しの変換
             content = re.sub(r'【(.+?)】', r'### \1', content)
             
             lines = []
             for line in content.split('\n'):
                 line = line.strip()
-                if line.startswith('+-'):
+                if line.startswith('+-') or line.startswith('|='):
                     continue
-                if '：' in line:
+                if '：' in line and not line.startswith('|'):
                     key, value = line.split('：', 1)
                     lines.append(f'### {key.strip()}\n{value.strip()}')
-                elif line and not line.startswith('|'):
+                elif line:
                     lines.append(line)
             
             return '\n\n'.join(lines)
@@ -57,10 +59,12 @@ class DocumentProcessor:
                         'content': []
                     })
                     current_section = structure[element.name][-1]
-                elif element.name == 'p' and current_section:
-                    current_section['content'].append(element.get_text().strip())
                 elif element.name == 'p':
-                    structure['text'].append(element.get_text().strip())
+                    text = element.get_text().strip()
+                    if current_section:
+                        current_section['content'].append(text)
+                    else:
+                        structure['text'].append(text)
             
             return structure
         except Exception as e:
@@ -72,32 +76,53 @@ class MessageConverter:
         self.selected_columns = None
         self.processor = DocumentProcessor()
         self.validation_rules = {
-            '原稿': lambda x: len(x) <= 200 if x else True,
-            '名前': lambda x: bool(x.strip()) if x else False
+            '原稿': lambda x: 150 <= len(x) <= 200 if x else False,
+            '名前': lambda x: bool(x and x.strip()),
+            '部署': lambda x: bool(x and x.strip()),
         }
 
+    def _clean_text(self, text: str) -> str:
+        """テキストのクリーニング"""
+        if not text:
+            return ""
+        # 余分な空白を削除
+        text = re.sub(r'\s+', ' ', text.strip())
+        # 特殊文字を削除
+        text = re.sub(r'[\r\n\t\f\v]', '', text)
+        return text
+
     def extract_potential_columns(self, content: str) -> Set[str]:
-        """DOCXコンテンツから実際に存在するカラムのみを抽出する"""
-        columns = set(['番号'])
+        """DOCXコンテンツから実際に存在するカラムのみを抽出"""
+        columns = set(['番号'])  # 基本カラム
         
-        # テーブルヘッダーからカラムを抽出
-        table_headers = re.findall(r'\|\s*([^|]+?)\s*(?:：|\:)', content)
-        for header in table_headers:
-            normalized = self._normalize_column_name(header)
-            if normalized:
-                columns.add(normalized)
+        # テーブル内のカラム抽出（改善版）
+        table_pattern = r'\|(.*?)\|'
+        table_rows = re.findall(table_pattern, content, re.MULTILINE)
         
-        # その他のパターンからカラムを抽出
-        patterns = [
-            (r'【(.+?)】', 1),
-            (r'■\s*(.+?)\s*[:：]', 1),
-            (r'□\s*(.+?)\s*[:：]', 1),
-            (r'●\s*(.+?)\s*[:：]', 1),
+        for row in table_rows:
+            # セル内のテキストを抽出
+            cells = [cell.strip() for cell in row.split('|')]
+            for cell in cells:
+                # カラム名のパターンを検出
+                if '：' in cell or ':' in cell:
+                    key = cell.split('：')[0].split(':')[0].strip()
+                    if key:
+                        normalized = self._normalize_column_name(key)
+                        if normalized:
+                            columns.add(normalized)
+
+        # 見出しからのカラム抽出
+        header_patterns = [
+            (r'【(.+?)】', 1),            # 【見出し】
+            (r'■\s*(.+?)\s*[:：]', 1),    # ■見出し：
+            (r'□\s*(.+?)\s*[:：]', 1),    # □見出し：
+            (r'●\s*(.+?)\s*[:：]', 1),    # ●見出し：
+            (r'^(?:■|□|●)?\s*(.+?)\s*[:：](?!\d)', 1),  # キー：（時刻を除外）
         ]
         
         for line in content.split('\n'):
             line = line.strip()
-            for pattern, group in patterns:
+            for pattern, group in header_patterns:
                 match = re.search(pattern, line)
                 if match:
                     column_name = match.group(group).strip()
@@ -106,10 +131,16 @@ class MessageConverter:
                         if normalized:
                             columns.add(normalized)
         
-        # 20文字以上のテキストブロックが存在する場合は「原稿」カラムを追加
+        # 長文検出による原稿カラムの追加
         paragraphs = content.split('\n')
-        if self._extract_main_content(paragraphs).strip():
+        main_content = self._extract_main_content(paragraphs)
+        if main_content and len(main_content) >= 20:
             columns.add('原稿')
+        
+        # 不要なカラムの除外
+        columns = {col for col in columns if not any(skip in col.lower() for skip in [
+            'について', 'お願い', 'です', 'ます', 'した', 'から', '注意', '備考'
+        ])}
         
         return columns
 
@@ -119,7 +150,7 @@ class MessageConverter:
         
         # 特定のプレフィックスとサフィックスを削除
         prefixes = ['部署', 'お', '■', '□', '●', '※']
-        suffixes = ['・事業所名', 'の内容', 'について', 'のお願い', '：', ':']
+        suffixes = ['・事業所名', 'の内容', 'について', 'のお願い', '：', ':', '欄']
         
         for prefix in prefixes:
             if name.startswith(prefix):
@@ -135,58 +166,69 @@ class MessageConverter:
             '締切日': '締切',
             '文字数': '文字制限',
             'メッセージ': '原稿',
-            '本文': '原稿'
+            '本文': '原稿',
+            '氏名': '名前',
+            'フリガナ': '名前',
+            '所属': '部署',
+            '事業所': '部署'
         }
         
         name = name.strip()
         return mapping.get(name, name)
 
     def _extract_main_content(self, paragraphs: List[str]) -> str:
-        """本文部分を抽出する（改善版）"""
+        """本文部分を抽出する（完全版）"""
         all_text_chunks = []
         current_chunk = []
         in_table = False
+        table_content = []
         
-        def process_chunk(chunk):
-            """テキストチャンクを処理して有効な本文かどうかを判断"""
+        def process_chunk(chunk: List[str]) -> str:
+            """テキストチャンクを処理"""
             text = ' '.join(chunk).strip()
-            # 数字のみの行を除外
-            if re.match(r'^\d+$', text):
-                return None
-            # メタデータっぽい行を除外
-            if re.match(r'^((?:●|■|※|【|》).+|.+[:：].+)$', text):
-                return None
-            # 区切り線を除外
-            if re.match(r'^[-=＝]+$', text):
-                return None
-            # 最低文字数を満たさないものを除外
-            if len(text) < 20:
-                return None
+            text = self._clean_text(text)
+            
+            # 無効なチャンクの判定
+            if any([
+                not text,
+                len(text) < 20,  # 短すぎるテキスト
+                re.match(r'^[\d\s]+$', text),  # 数字のみ
+                re.match(r'^[-=＝]+$', text),  # 区切り線
+                re.match(r'^((?:●|■|※|【|》).+?[:：]|.+?[:：].+?$)', text),  # メタデータ
+            ]):
+                return ""
+            
             return text
 
         for line in paragraphs:
-            line = line.strip()
+            line = self._clean_text(line)
             
-            # テーブル処理
-            if '+-' in line or '|' in line:
+            # テーブルの処理
+            if '|' in line or '+-' in line:
+                # 現在のチャンクを処理
                 if current_chunk:
                     if processed := process_chunk(current_chunk):
                         all_text_chunks.append(processed)
                     current_chunk = []
                 
-                in_table = True
-                # テーブルの行から本文を抽出
-                parts = [part.strip() for part in line.split('|')]
-                text_parts = [part for part in parts if part and not part.startswith('+')]
-                if text_parts:
-                    for part in text_parts:
-                        if len(part.strip()) >= 20:  # テーブル内の長いテキストは本文候補
-                            all_text_chunks.append(part.strip())
-                continue
+                # テーブル行の処理
+                if '|' in line:
+                    cells = [cell.strip() for cell in line.split('|')]
+                    for cell in cells:
+                        if len(cell) >= 20:  # 長いセル内容は本文候補
+                            table_content.append(cell)
                 
-            # テーブル終了判定
-            if in_table and not ('+-' in line or '|' in line):
+                in_table = True
+                continue
+            
+            # テーブル終了の検出
+            if in_table and not ('|' in line or '+-' in line):
                 in_table = False
+                # テーブル内容の処理
+                for content in table_content:
+                    if processed := process_chunk([content]):
+                        all_text_chunks.append(processed)
+                table_content = []
             
             # 通常のテキスト処理
             if not in_table:
@@ -203,19 +245,20 @@ class MessageConverter:
             if processed := process_chunk(current_chunk):
                 all_text_chunks.append(processed)
         
-        # 最も長いテキストチャンクを本文として採用
-        if all_text_chunks:
-            main_content = max(all_text_chunks, key=len)
+        # 最適な本文を選択
+        if not all_text_chunks:
+            return ""
             
-            # 文字数制限のバリデーション（150〜200文字）
-            if len(main_content) < 150:
-                return f"{main_content}（要追記）"
-            elif len(main_content) > 200:
-                return f"{main_content[:200]}（文字数超過）"
-            
-            return main_content
+        # 最も長い本文を選択
+        main_content = max(all_text_chunks, key=len)
         
-        return ""
+        # 文字数制限のバリデーション
+        if len(main_content) < 150:
+            return f"{main_content}（要追記）"
+        elif len(main_content) > 200:
+            return f"{main_content[:200]}（文字数超過）"
+        
+        return main_content
 
     def extract_content_for_column(self, structure: Dict, column: str) -> str:
         """特定のカラムの内容を抽出"""
@@ -232,7 +275,16 @@ class MessageConverter:
             paragraphs = structure['text']
             content = [self._extract_main_content(paragraphs)]
         
-        return ' '.join(content).strip()
+        # 特定のカラム用の後処理
+        result = ' '.join(content).strip()
+        if column == '原稿':
+            # 文字数チェックは_extract_main_contentで実施済み
+            return result
+        elif column in ['部署', '名前']:
+            # 部署と名前は最初の有効な値のみを使用
+            return result.split()[0] if result else ""
+        
+        return result
 
     def validate_data(self, data: Dict[str, str]) -> List[str]:
         """データのバリデーション"""
@@ -241,9 +293,12 @@ class MessageConverter:
             if field in data:
                 if not rule(data[field]):
                     if field == '原稿':
-                        errors.append(f"{field}が200文字を超えています")
+                        word_count = len(data[field])
+                        errors.append(
+                            f"{field}の文字数が不適切です（現在: {word_count}文字, 要件: 150-200文字）"
+                        )
                     else:
-                        errors.append(f"{field}が無効です")
+                        errors.append(f"{field}が未入力です")
         return errors
 
     def process_document(self, doc: Dict, index: int) -> Tuple[Dict, List[ProcessingError]]:
@@ -253,6 +308,7 @@ class MessageConverter:
             structure = self.processor.extract_structure(md_content)
             
             data = {'番号': index + 1}
+            
             # 特別なカラムの処理
             if '企画' in self.selected_columns:
                 data['企画'] = self.extract_content_for_column(structure, '企画名') or \
