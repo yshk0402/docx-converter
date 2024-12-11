@@ -1,44 +1,150 @@
-import pandas as pd
 import re
-from typing import Dict, List, Set, Tuple
+import pandas as pd
+from typing import Dict, List, Set, Tuple, Optional
 from datetime import datetime
 import markdown
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
+import logging
+from pathlib import Path
 
 @dataclass
 class ProcessingError:
+    """処理エラー情報を格納するデータクラス"""
     document_index: int
     error_type: str
     message: str
     details: str = ""
+    timestamp: datetime = datetime.now()
+
+    def to_dict(self) -> Dict:
+        """エラー情報を辞書形式で返す"""
+        return {
+            'index': self.document_index,
+            'type': self.error_type,
+            'message': self.message,
+            'details': self.details,
+            'timestamp': self.timestamp.isoformat()
+        }
+
+class TextNormalizer:
+    """テキスト正規化を行うユーティリティクラス"""
+    @staticmethod
+    def normalize_spaces(text: str) -> str:
+        """空白の正規化"""
+        return ' '.join(text.split())
+    
+    @staticmethod
+    def normalize_japanese_numbers(text: str) -> str:
+        """日本語数字の正規化"""
+        mapping = str.maketrans('０１２３４５６７８９', '0123456789')
+        return text.translate(mapping)
+    
+    @staticmethod
+    def clean_text(text: str) -> str:
+        """テキストの総合的なクリーニング"""
+        if not text:
+            return ""
+        # 改行とタブを空白に変換
+        text = re.sub(r'[\n\t\r]', ' ', text)
+        # 複数の空白を1つに
+        text = re.sub(r'\s+', ' ', text)
+        # 全角数字を半角に
+        text = TextNormalizer.normalize_japanese_numbers(text)
+        return text.strip()
 
 class DocumentProcessor:
+    """文書処理を行うクラス"""
     def __init__(self):
         self.errors: List[ProcessingError] = []
+        self._setup_logging()
+
+    def _setup_logging(self):
+        """ロギングの設定"""
+        log_dir = Path.home() / '.docx_converter' / 'logs'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / 'document_processor.log'
         
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        self.logger = logging.getLogger(__name__)
+
     def convert_to_markdown(self, content: str) -> str:
         """文書をMarkdown形式に変換"""
         try:
-            # 特殊文字のエスケープ
-            content = content.replace('*', '\*')
-            # 見出しの変換
+            # 文書のクリーニング
+            content = TextNormalizer.clean_text(content)
+            
+            # セクション見出しの変換
             content = re.sub(r'【(.+?)】', r'### \1', content)
             
             lines = []
+            in_table = False
+            table_content = []
+            
             for line in content.split('\n'):
                 line = line.strip()
-                if line.startswith('+-') or line.startswith('|='):
+                
+                # テーブル処理
+                if '|' in line or line.startswith('+-'):
+                    if not in_table:
+                        if table_content:
+                            lines.extend(table_content)
+                            table_content = []
+                        in_table = True
+                    table_content.append(line)
                     continue
-                if '：' in line and not line.startswith('|'):
-                    key, value = line.split('：', 1)
-                    lines.append(f'### {key.strip()}\n{value.strip()}')
-                elif line:
-                    lines.append(line)
+                
+                # テーブル終了の検出
+                if in_table and not ('|' in line or line.startswith('+-')):
+                    in_table = False
+                    if table_content:
+                        # テーブル内容を処理してから追加
+                        processed_table = self._process_table_content(table_content)
+                        lines.extend(processed_table)
+                        table_content = []
+                
+                # 通常のテキスト処理
+                if not in_table:
+                    if '：' in line:
+                        key, value = line.split('：', 1)
+                        lines.append(f'### {key.strip()}\n{value.strip()}')
+                    elif line:
+                        lines.append(line)
+            
+            # 最後のテーブルの処理
+            if table_content:
+                processed_table = self._process_table_content(table_content)
+                lines.extend(processed_table)
             
             return '\n\n'.join(lines)
         except Exception as e:
+            self.logger.error(f"Markdown変換エラー: {str(e)}")
             raise ValueError(f"Markdown変換エラー: {str(e)}")
+
+    def _process_table_content(self, table_content: List[str]) -> List[str]:
+        """テーブル内容の処理"""
+        processed_lines = []
+        for line in table_content:
+            if line.startswith('+-'):
+                continue
+            
+            # セル内容の抽出と処理
+            cells = [cell.strip() for cell in line.split('|')]
+            cells = [cell for cell in cells if cell]  # 空のセルを除去
+            
+            for cell in cells:
+                if len(cell) >= 20:  # 長いテキストは本文候補
+                    processed_lines.append(cell)
+                elif '：' in cell:  # メタデータは見出しとして処理
+                    key, value = cell.split('：', 1)
+                    processed_lines.append(f'### {key.strip()}\n{value.strip()}')
+        
+        return processed_lines
 
     def extract_structure(self, markdown_content: str) -> Dict:
         """Markdownから構造を抽出"""
@@ -60,7 +166,7 @@ class DocumentProcessor:
                     })
                     current_section = structure[element.name][-1]
                 elif element.name == 'p':
-                    text = element.get_text().strip()
+                    text = TextNormalizer.clean_text(element.get_text())
                     if current_section:
                         current_section['content'].append(text)
                     else:
@@ -68,42 +174,36 @@ class DocumentProcessor:
             
             return structure
         except Exception as e:
+            self.logger.error(f"構造抽出エラー: {str(e)}")
             raise ValueError(f"構造抽出エラー: {str(e)}")
 
 class MessageConverter:
+    """メッセージ変換の主要クラス"""
     def __init__(self):
-        self.default_columns = ['番号']
-        self.selected_columns = None
         self.processor = DocumentProcessor()
+        self.text_normalizer = TextNormalizer()
+        self.selected_columns: Optional[List[str]] = None
+        self.logger = self.processor.logger
+        
+        # バリデーションルール
         self.validation_rules = {
             '原稿': lambda x: 150 <= len(x) <= 200 if x else False,
             '名前': lambda x: bool(x and x.strip()),
             '部署': lambda x: bool(x and x.strip()),
+            '企画': lambda x: bool(x and x.strip()),
         }
-
-    def _clean_text(self, text: str) -> str:
-        """テキストのクリーニング"""
-        if not text:
-            return ""
-        # 余分な空白を削除
-        text = re.sub(r'\s+', ' ', text.strip())
-        # 特殊文字を削除
-        text = re.sub(r'[\r\n\t\f\v]', '', text)
-        return text
 
     def extract_potential_columns(self, content: str) -> Set[str]:
         """DOCXコンテンツから実際に存在するカラムのみを抽出"""
         columns = set(['番号'])  # 基本カラム
         
-        # テーブル内のカラム抽出（改善版）
+        # テーブル内のカラム抽出
         table_pattern = r'\|(.*?)\|'
         table_rows = re.findall(table_pattern, content, re.MULTILINE)
         
         for row in table_rows:
-            # セル内のテキストを抽出
             cells = [cell.strip() for cell in row.split('|')]
             for cell in cells:
-                # カラム名のパターンを検出
                 if '：' in cell or ':' in cell:
                     key = cell.split('：')[0].split(':')[0].strip()
                     if key:
@@ -113,11 +213,11 @@ class MessageConverter:
 
         # 見出しからのカラム抽出
         header_patterns = [
-            (r'【(.+?)】', 1),            # 【見出し】
-            (r'■\s*(.+?)\s*[:：]', 1),    # ■見出し：
-            (r'□\s*(.+?)\s*[:：]', 1),    # □見出し：
-            (r'●\s*(.+?)\s*[:：]', 1),    # ●見出し：
-            (r'^(?:■|□|●)?\s*(.+?)\s*[:：](?!\d)', 1),  # キー：（時刻を除外）
+            (r'【(.+?)】', 1),
+            (r'■\s*(.+?)\s*[:：]', 1),
+            (r'□\s*(.+?)\s*[:：]', 1),
+            (r'●\s*(.+?)\s*[:：]', 1),
+            (r'^(?:■|□|●)?\s*(.+?)\s*[:：](?!\d)', 1),
         ]
         
         for line in content.split('\n'):
@@ -186,36 +286,34 @@ class MessageConverter:
         def process_chunk(chunk: List[str]) -> str:
             """テキストチャンクを処理"""
             text = ' '.join(chunk).strip()
-            text = self._clean_text(text)
+            text = self.text_normalizer.clean_text(text)
             
             # 無効なチャンクの判定
             if any([
                 not text,
-                len(text) < 20,  # 短すぎるテキスト
-                re.match(r'^[\d\s]+$', text),  # 数字のみ
-                re.match(r'^[-=＝]+$', text),  # 区切り線
-                re.match(r'^((?:●|■|※|【|》).+?[:：]|.+?[:：].+?$)', text),  # メタデータ
+                len(text) < 20,
+                re.match(r'^[\d\s]+$', text),
+                re.match(r'^[-=＝]+$', text),
+                re.match(r'^((?:●|■|※|【|》).+?[:：]|.+?[:：].+?$)', text),
             ]):
                 return ""
             
             return text
 
         for line in paragraphs:
-            line = self._clean_text(line)
+            line = self.text_normalizer.clean_text(line)
             
-            # テーブルの処理
+            # テーブル処理
             if '|' in line or '+-' in line:
-                # 現在のチャンクを処理
                 if current_chunk:
                     if processed := process_chunk(current_chunk):
                         all_text_chunks.append(processed)
                     current_chunk = []
                 
-                # テーブル行の処理
                 if '|' in line:
                     cells = [cell.strip() for cell in line.split('|')]
                     for cell in cells:
-                        if len(cell) >= 20:  # 長いセル内容は本文候補
+                        if len(cell) >= 20:
                             table_content.append(cell)
                 
                 in_table = True
@@ -224,7 +322,6 @@ class MessageConverter:
             # テーブル終了の検出
             if in_table and not ('|' in line or '+-' in line):
                 in_table = False
-                # テーブル内容の処理
                 for content in table_content:
                     if processed := process_chunk([content]):
                         all_text_chunks.append(processed)
@@ -278,76 +375,6 @@ class MessageConverter:
         # 特定のカラム用の後処理
         result = ' '.join(content).strip()
         if column == '原稿':
-            # 文字数チェックは_extract_main_contentで実施済み
             return result
         elif column in ['部署', '名前']:
-            # 部署と名前は最初の有効な値のみを使用
-            return result.split()[0] if result else ""
-        
-        return result
-
-    def validate_data(self, data: Dict[str, str]) -> List[str]:
-        """データのバリデーション"""
-        errors = []
-        for field, rule in self.validation_rules.items():
-            if field in data:
-                if not rule(data[field]):
-                    if field == '原稿':
-                        word_count = len(data[field])
-                        errors.append(
-                            f"{field}の文字数が不適切です（現在: {word_count}文字, 要件: 150-200文字）"
-                        )
-                    else:
-                        errors.append(f"{field}が未入力です")
-        return errors
-
-    def process_document(self, doc: Dict, index: int) -> Tuple[Dict, List[ProcessingError]]:
-        """単一文書の処理"""
-        try:
-            md_content = self.processor.convert_to_markdown(doc['document_content'])
-            structure = self.processor.extract_structure(md_content)
-            
-            data = {'番号': index + 1}
-            
-            # 特別なカラムの処理
-            if '企画' in self.selected_columns:
-                data['企画'] = self.extract_content_for_column(structure, '企画名') or \
-                            self.extract_content_for_column(structure, '企画')
-
-            # その他のカラム処理
-            for column in self.selected_columns:
-                if column not in data:  # まだ処理されていないカラムのみ
-                    content = self.extract_content_for_column(structure, column)
-                    data[column] = content
-
-            # バリデーション
-            validation_errors = self.validate_data(data)
-            if validation_errors:
-                for error in validation_errors:
-                    self.processor.errors.append(
-                        ProcessingError(index, "検証エラー", error)
-                    )
-
-            return data, self.processor.errors
-
-        except Exception as e:
-            self.processor.errors.append(
-                ProcessingError(index, "処理エラー", str(e))
-            )
-            return None, self.processor.errors
-
-    def process_documents(self, documents: List[Dict]) -> Tuple[pd.DataFrame, List[ProcessingError]]:
-        """複数文書の処理"""
-        processed_docs = []
-        self.processor.errors = []  # エラーリストのリセット
-
-        for idx, doc in enumerate(documents):
-            result, errors = self.process_document(doc, idx)
-            if result:
-                processed_docs.append(result)
-
-        if not processed_docs:
-            return pd.DataFrame(), self.processor.errors
-
-        df = pd.DataFrame(processed_docs)
-        return df, self.processor.errors
+            return
